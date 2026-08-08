@@ -1,95 +1,86 @@
-import crypto from 'crypto';
+import os, json, hashlib, uuid, time, requests
+from flask import Flask, request, jsonify
 
-const usedTxns = new Map();
+app = Flask(__name__)
+used_txns = {}
 
-function isTransactionUsed(txn, ttlSeconds = 86400) {
-  const entry = usedTxns.get(txn);
-  if (entry && Date.now() - entry.timestamp < ttlSeconds * 1000) return true;
-  usedTxns.set(txn, { timestamp: Date.now() });
-  return false;
-}
+def is_transaction_used(txn, ttl_seconds=86400):
+    entry = used_txns.get(txn)
+    if entry and (time.time() - entry['timestamp'] < ttl_seconds):
+        return True
+    used_txns[txn] = {'timestamp': time.time()}
+    return False
 
-function deleteTransaction(txn) {
-  usedTxns.delete(txn);
-}
+def delete_transaction(txn):
+    used_txns.pop(txn, None)
 
-function generateSignature(params, secret) {
-  const sortedKeys = Object.keys(params).sort();
-  const signStr = sortedKeys.map(k => `${k}=${params[k]}`).join('&') + `&key=${secret}`;
-  return crypto.createHash('md5').update(signStr).digest('hex');
-}
+def generate_signature(params, secret):
+    sorted_keys = sorted(params.keys())
+    sign_str = '&'.join([f"{k}={params[k]}" for k in sorted_keys]) + f"&key={secret}"
+    return hashlib.md5(sign_str.encode()).hexdigest()
 
-export default async function handler(req, res) {
-  const params = req.method === 'POST' ? req.body : req.query;
-  const { user, pass, amount, txn } = params;
+@app.route('/', methods=['GET', 'POST'])
+def handler():
+    data = request.get_json() if request.method == 'POST' else request.args.to_dict()
+    user = data.get('user')
+    passwd = data.get('pass')
+    amount = data.get('amount')
+    txn = data.get('txn')
 
-  if (!user || !pass || !amount || !txn) {
-    return res.status(400).json({ error: 'Missing user, pass, amount, or txn' });
-  }
+    if not all([user, passwd, amount, txn]):
+        return jsonify({'error': 'Missing params'}), 400
 
-  // ✅ 'user' can be a number, email, or any string – we just compare it.
-  const validUser = process.env.ALLOWED_USER || 'demo';    // e.g., '123456'
-  const validPass = process.env.ALLOWED_PASS || 'secure';
-  if (user !== validUser || pass !== validPass) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
+    # ✅ 'user' can be number, email, any string
+    valid_user = os.getenv('ALLOWED_USER', '123456')   # example numeric
+    valid_pass = os.getenv('ALLOWED_PASS', 'secret')
+    if user != valid_user or passwd != valid_pass:
+        return jsonify({'error': 'Invalid credentials'}), 401
 
-  const numericAmount = parseFloat(amount);
-  if (isNaN(numericAmount) || numericAmount <= 0) {
-    return res.status(400).json({ error: 'Amount must be > 0' });
-  }
+    try:
+        numeric_amount = float(amount)
+        if numeric_amount <= 0: raise ValueError
+    except:
+        return jsonify({'error': 'Invalid amount'}), 400
 
-  if (isTransactionUsed(txn)) {
-    return res.status(409).json({ error: 'Transaction ID already used' });
-  }
+    if is_transaction_used(txn):
+        return jsonify({'error': 'Transaction ID already used'}), 409
 
-  const merchantOrderNo = `ORDER_${txn}`;
-  const config = {
-    appId: process.env.UPAY_APP_ID,
-    apiKey: process.env.UPAY_API_KEY,
-    secretKey: process.env.UPAY_SECRET_KEY,
-    notifyUrl: `${process.env.BASE_URL}/api/webhook/upay`,
-  };
-
-  const orderParams = {
-    appId: config.appId,
-    merchantOrderNo,
-    chainType: '1',
-    fiatAmount: String(numericAmount),
-    fiatCurrency: 'USD',
-    notifyUrl: config.notifyUrl,
-  };
-
-  const sign = generateSignature(orderParams, config.secretKey);
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-UPA-APIKEY': config.apiKey,
-    'X-UPA-REQUESTID': crypto.randomUUID(),
-    'X-UPA-TIMESTAMP': Date.now().toString(),
-    'X-UPA-SIGN': sign,
-  };
-
-  try {
-    const response = await fetch('https://api.upay.ink/v1/api/open/order/apply', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(orderParams),
-    });
-    const result = await response.json();
-
-    if (result.code === '0000' && result.data?.payUrl) {
-      return res.status(200).json({
-        success: true,
-        paymentUrl: result.data.payUrl,
-        orderId: merchantOrderNo,
-      });
-    } else {
-      deleteTransaction(txn);
-      return res.status(500).json({ error: result.msg || 'UPay error' });
+    merchant_order_no = f"ORDER_{txn}"
+    config = {
+        'appId': os.environ['UPAY_APP_ID'],
+        'apiKey': os.environ['UPAY_API_KEY'],
+        'secretKey': os.environ['UPAY_SECRET_KEY'],
+        'notifyUrl': f"{os.environ['BASE_URL']}/api/webhook/upay"
     }
-  } catch (error) {
-    deleteTransaction(txn);
-    console.error(error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-}
+    order_params = {
+        'appId': config['appId'],
+        'merchantOrderNo': merchant_order_no,
+        'chainType': '1',
+        'fiatAmount': str(numeric_amount),
+        'fiatCurrency': 'USD',
+        'notifyUrl': config['notifyUrl'],
+    }
+    sign = generate_signature(order_params, config['secretKey'])
+    headers = {
+        'Content-Type': 'application/json',
+        'X-UPA-APIKEY': config['apiKey'],
+        'X-UPA-REQUESTID': str(uuid.uuid4()),
+        'X-UPA-TIMESTAMP': str(int(time.time() * 1000)),
+        'X-UPA-SIGN': sign,
+    }
+    try:
+        resp = requests.post('https://api.upay.ink/v1/api/open/order/apply',
+                             headers=headers, json=order_params, timeout=30)
+        result = resp.json()
+        if result.get('code') == '0000' and result.get('data', {}).get('payUrl'):
+            return jsonify({'success': True, 'paymentUrl': result['data']['payUrl'],
+                            'orderId': merchant_order_no}), 200
+        else:
+            delete_transaction(txn)
+            return jsonify({'error': result.get('msg', 'UPay error')}), 500
+    except Exception as e:
+        delete_transaction(txn)
+        print(e)
+        return jsonify({'error': 'Internal error'}), 500
+
+app = app
