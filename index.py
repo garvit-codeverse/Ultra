@@ -4,12 +4,11 @@ import hashlib
 import uuid
 import time
 import requests
-from datetime import datetime
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# In-memory store for used txns (replace with Redis/Vercel KV)
+# ---------- In-memory cache for used txns ----------
 used_txns = {}
 
 def is_transaction_used(txn, ttl_seconds=86400):
@@ -22,15 +21,18 @@ def is_transaction_used(txn, ttl_seconds=86400):
 def delete_transaction(txn):
     used_txns.pop(txn, None)
 
+# ---------- UPay Signature ----------
 def generate_signature(params, secret):
     sorted_keys = sorted(params.keys())
     sign_str = '&'.join([f"{k}={params[k]}" for k in sorted_keys]) + f"&key={secret}"
     return hashlib.md5(sign_str.encode()).hexdigest()
 
-@app.route('/api/pay', methods=['GET', 'POST'])
-def pay():
+# ---------- Main Handler ----------
+@app.route('/', methods=['GET', 'POST'])
+# Or if mapped to /api, keep it. Vercel routes /api to index.py
+def handler():
     if request.method == 'POST':
-        data = request.get_json()
+        data = request.get_json() or {}
     else:
         data = request.args.to_dict()
 
@@ -42,10 +44,11 @@ def pay():
     if not all([user, passwd, amount, txn]):
         return jsonify({'error': 'Missing user, pass, amount, or txn'}), 400
 
-    # Replace with your own user validation
-    VALID_USERS = {'demo@example.com': 'securepass'}
-    if VALID_USERS.get(user) != passwd:
-        return jsonify({'error': 'Invalid user or password'}), 401
+    # Replace with your own auth logic
+    valid_user = os.getenv('ALLOWED_USER', 'demo@gmail.com')
+    valid_pass = os.getenv('ALLOWED_PASS', 'secure123')
+    if user != valid_user or passwd != valid_pass:
+        return jsonify({'error': 'Invalid email or password'}), 401
 
     try:
         numeric_amount = float(amount)
@@ -54,11 +57,9 @@ def pay():
     except ValueError:
         return jsonify({'error': 'Amount must be a positive number'}), 400
 
-    # Check for duplicate txn
     if is_transaction_used(txn):
         return jsonify({'error': 'Transaction ID already used'}), 409
 
-    # Prepare UPay order
     merchant_order_no = f"ORDER_{txn}"
     config = {
         'appId': os.environ['UPAY_APP_ID'],
@@ -67,17 +68,16 @@ def pay():
         'notifyUrl': f"{os.environ['BASE_URL']}/api/webhook/upay"
     }
 
-    params = {
+    order_params = {
         'appId': config['appId'],
         'merchantOrderNo': merchant_order_no,
-        'chainType': '1',  # TRC20
+        'chainType': '1',
         'fiatAmount': str(numeric_amount),
         'fiatCurrency': 'USD',
         'notifyUrl': config['notifyUrl'],
     }
 
-    sign = generate_signature(params, config['secretKey'])
-
+    sign = generate_signature(order_params, config['secretKey'])
     headers = {
         'Content-Type': 'application/json',
         'X-UPA-APIKEY': config['apiKey'],
@@ -90,7 +90,7 @@ def pay():
         resp = requests.post(
             'https://api.upay.ink/v1/api/open/order/apply',
             headers=headers,
-            json=params,
+            json=order_params,
             timeout=30
         )
         result = resp.json()
@@ -101,12 +101,12 @@ def pay():
                 'orderId': merchant_order_no
             }), 200
         else:
-            # UPay failed – remove txn from used list to allow retry
             delete_transaction(txn)
-            return jsonify({'error': result.get('msg', 'UPay API error')}), 500
+            return jsonify({'error': result.get('msg', 'UPay error')}), 500
     except Exception as e:
         delete_transaction(txn)
-        return jsonify({'error': str(e)}), 500
+        print(f"UPay error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
-# Vercel expects a handler named `app`
+# Vercel expects `app` as the WSGI handler
 app = app
